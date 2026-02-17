@@ -143,6 +143,7 @@ export interface IBoard3D {
   setActiveTimeline(id: number): void;
   focusTimeline(id: number, animate: boolean): void;
   addBranchLine(fromTlId: number, fromTurn: number, toTlId: number): void;
+  notifySnapshotAdded(timelineId: number): void;
   spawnPortalEffect(timelineId: number, square: string): void;
   spawnCaptureEffect(timelineId: number, square: string): void;
   clearAll(): void;

@@ -956,6 +956,9 @@ timelines - list timelines`,
       col.showLastMove(move.from, move.to);
     }
 
+    // Notify that snapshot was added - triggers branch line rebuild
+    Board3D.notifySnapshotAdded(tlId);
+
     // Spawn capture effect if this was a capture
     if (move.captured) {
       Board3D.spawnCaptureEffect(tlId, move.to);
@@ -1116,6 +1119,10 @@ timelines - list timelines`,
 
     // Draw line between timelines to show the move
     Board3D.addCrossTimelineLine(sourceTimelineId, targetTimelineId, square, isWhite);
+
+    // Notify that snapshots were added - triggers branch line rebuild
+    Board3D.notifySnapshotAdded(sourceTimelineId);
+    Board3D.notifySnapshotAdded(targetTimelineId);
 
     // 5. Update UI
     console.log('[crossTimeline] VISUAL_TRAILS_DEBUG: About to render after cross-timeline move', {
@@ -1286,6 +1293,9 @@ timelines - list timelines`,
       // Immediately re-render to show piece removal (don't wait until end)
       sourceCol.render(sourceTl.chess.board());
     }
+
+    // Notify that snapshot was added - triggers branch line rebuild
+    Board3D.notifySnapshotAdded(sourceTimelineId);
 
     // Spawn portal effect at departure point
     Board3D.spawnPortalEffect(sourceTimelineId, sourceSquare);
