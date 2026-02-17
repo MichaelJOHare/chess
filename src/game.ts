@@ -1881,8 +1881,8 @@ timelines - list timelines`,
       move = moves[Math.floor(Math.random() * moves.length)];
     }
 
-    // Execute the move
-    this.makeMove(tlId, move);
+    // Execute the move (auto-queen for CPU promotions)
+    this.makeMove(tlId, move, move.promotion ? 'q' : undefined);
     return true;
   }
 
