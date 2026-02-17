@@ -303,7 +303,7 @@ export class TimelineCol implements ITimelineCol {
   private pieceMeshes: Sprite[] = [];
   private highlightMeshes: HighlightEntry[] = [];
   private lastMoveHL: Mesh[] = [];
-  private historyLayers: Group[] = [];
+  historyLayers: Group[] = [];  // Public for branch line rebuilding
   private historySquareMeshes: Mesh[] = [];
   private moveLineGroup: Group;
   interLayerGroup: Group;
@@ -689,7 +689,9 @@ export class TimelineCol implements ITimelineCol {
     return this.drawnBranchIndices.has(snapshotIndex);
   }
 
-  /* persistent move lines on current board */
+  /* persistent move lines on current board - keep only last N to prevent clutter */
+  private static MAX_MOVE_LINES = 8;  // Only show last 8 moves on top board
+
   addMoveLine(fromSq: string, toSq: string, isWhite: boolean): void {
     const a = this._sqToWorld(fromSq, 0.09);
     const b = this._sqToWorld(toSq, 0.09);
@@ -698,6 +700,21 @@ export class TimelineCol implements ITimelineCol {
     // Softer, more muted colors and much lower opacity for in-board move lines
     const col = isWhite ? 0x6688bb : 0xbb8866;  // Lighter, desaturated blue/red
     this.moveLineGroup.add(Board3DManager._glowTube(a, b, col, 0.012, 0.04, false, 0.3));  // Thinner, less glow, 30% opacity
+
+    // Remove old lines to prevent clutter - keep only last N
+    while (this.moveLineGroup.children.length > TimelineCol.MAX_MOVE_LINES) {
+      const old = this.moveLineGroup.children[0];
+      this.moveLineGroup.remove(old);
+      // Dispose of materials to prevent memory leak
+      if (old instanceof THREE.Group) {
+        old.traverse((child: Object3D) => {
+          const mesh = child as Mesh;
+          if (mesh.isMesh && mesh.material) {
+            (mesh.material as Material).dispose();
+          }
+        });
+      }
+    }
   }
 
   /* history snapshot */
@@ -1017,6 +1034,17 @@ class Board3DManager implements IBoard3D {
   timelineCols: Record<number, TimelineCol> = {};
   private branchLineGroup: Group | null = null;
   private particleSystem: Points | null = null;
+
+  // Track branch/time-travel line metadata for rebuilding when snapshots shift
+  private _branchLineData: Array<{
+    type: 'branch' | 'cross' | 'timetravel';
+    fromTlId: number;
+    toTlId: number;
+    fromTurn: number;  // Snapshot index in source timeline at time of creation
+    square?: string;
+    targetTurnIndex?: number;  // For time travel: target snapshot index
+    isWhite?: boolean;
+  }> = [];
   private onSquareClick:
     | ((info: { timelineId: number; square: string; turn: number; isHistory: boolean }) => void)
     | null = null;
@@ -1254,30 +1282,34 @@ class Board3DManager implements IBoard3D {
     }
     fromCol.markBranchDrawn(branchKey);
 
-    const fromY = -(fromTurn + 1) * TimelineCol.LAYER_GAP;
-    const from = new THREE.Vector3(fromCol.xOffset, fromY + 0.2, 0);
-    const to = new THREE.Vector3(toCol.xOffset, 0.2, 0);
-    const tintCol = this.TIMELINE_COLORS[toTlId % this.TIMELINE_COLORS.length];
-    this.branchLineGroup.add(Board3DManager._glowTube(from, to, tintCol, 0.04, 0.18, true));
+    // Store metadata for rebuilding when snapshots shift
+    this._branchLineData.push({
+      type: 'branch',
+      fromTlId,
+      toTlId,
+      fromTurn,
+    });
+
+    this._rebuildBranchLines();
   }
 
   /** Add a horizontal line showing cross-timeline piece movement */
-  addCrossTimelineLine(fromTlId: number, toTlId: number, square: string, _isWhite: boolean): void {
+  addCrossTimelineLine(fromTlId: number, toTlId: number, square: string, isWhite: boolean): void {
     const fromCol = this.timelineCols[fromTlId];
     const toCol = this.timelineCols[toTlId];
     if (!fromCol || !toCol || !this.branchLineGroup) return;
 
-    // Get the 3D position of the square in each timeline
-    const pos = this._fromSq(square);
-    const sqX = pos.c - 3.5;
-    const sqZ = pos.r - 3.5;
+    // Store metadata for rebuilding when snapshots shift
+    this._branchLineData.push({
+      type: 'cross',
+      fromTlId,
+      toTlId,
+      fromTurn: fromCol.historyLayers.length,  // Current snapshot count
+      square,
+      isWhite,
+    });
 
-    const from = new THREE.Vector3(fromCol.xOffset + sqX, 0.3, sqZ);
-    const to = new THREE.Vector3(toCol.xOffset + sqX, 0.3, sqZ);
-
-    // Purple for cross-timeline moves
-    const color = 0xaa44ff;
-    this.branchLineGroup.add(Board3DManager._glowTube(from, to, color, 0.03, 0.12, true));
+    this._rebuildBranchLines();
   }
 
   /** Add a time travel line showing queen moving backward in time to create new timeline */
@@ -1286,45 +1318,125 @@ class Board3DManager implements IBoard3D {
     targetTurnIndex: number,
     newTlId: number,
     square: string,
-    _isWhite: boolean
+    isWhite: boolean
   ): void {
     const sourceCol = this.timelineCols[sourceTlId];
     const newCol = this.timelineCols[newTlId];
     if (!sourceCol || !newCol || !this.branchLineGroup) return;
 
-    const pos = this._fromSq(square);
-    const sqX = pos.c - 3.5;
-    const sqZ = pos.r - 3.5;
+    // Store metadata for rebuilding when snapshots shift
+    // fromTurn = current snapshot count at time of travel (so we know the offset)
+    this._branchLineData.push({
+      type: 'timetravel',
+      fromTlId: sourceTlId,
+      toTlId: newTlId,
+      fromTurn: sourceCol.historyLayers.length,  // Snapshot count at time of creation
+      targetTurnIndex,
+      square,
+      isWhite,
+    });
 
-    // Line goes: source board (top) -> down through time -> across to new timeline
-    const sourceY = 0.3;  // Current board height
-    // Note: targetTurnIndex was computed BEFORE the departure snapshot was added to source.
-    // After addSnapshot(), history layers shift down: layer at index i moves to index i+1.
-    // So we add 1 to get the correct adjusted layer position.
-    const adjustedTurnIndex = targetTurnIndex + 1;
-    const targetY = -(adjustedTurnIndex + 1) * TimelineCol.LAYER_GAP + 0.2;  // Historical layer height
-
-    // Start point: queen's position on current source board
-    const start = new THREE.Vector3(sourceCol.xOffset + sqX, sourceY, sqZ);
-
-    // Mid point: same square but at the historical layer depth (in source timeline)
-    const mid = new THREE.Vector3(sourceCol.xOffset + sqX, targetY, sqZ);
-
-    // End point: the new timeline's current board (where queen arrived)
-    const end = new THREE.Vector3(newCol.xOffset + sqX, 0.3, sqZ);
-
-    // Cyan-green for time travel
-    const color = 0x44ffaa;
-
-    // Vertical line down through time
-    this.branchLineGroup.add(Board3DManager._glowTube(start, mid, color, 0.03, 0.12, false));
-
-    // Horizontal/arc line to new timeline
-    this.branchLineGroup.add(Board3DManager._glowTube(mid, end, color, 0.03, 0.12, true));
+    this._rebuildBranchLines();
   }
 
   private _fromSq(sq: string): { r: number; c: number } {
     return { r: 8 - parseInt(sq[1]), c: sq.charCodeAt(0) - 97 };
+  }
+
+  /** Rebuild all branch/cross/time-travel lines based on stored metadata */
+  private _rebuildBranchLines(): void {
+    if (!this.branchLineGroup) return;
+
+    // Clear existing lines
+    while (this.branchLineGroup.children.length) {
+      this.branchLineGroup.remove(this.branchLineGroup.children[0]);
+    }
+
+    // Rebuild each line from metadata
+    for (const data of this._branchLineData) {
+      const fromCol = this.timelineCols[data.fromTlId];
+      const toCol = this.timelineCols[data.toTlId];
+      if (!fromCol || !toCol) continue;
+
+      if (data.type === 'branch') {
+        // Branch line: from history layer to new timeline's top board
+        // Calculate depth based on how many snapshots have been added since branch
+        const currentDepth = fromCol.historyLayers.length;
+        const depthSinceBranch = currentDepth - data.fromTurn;
+        const fromY = -(depthSinceBranch + 1) * TimelineCol.LAYER_GAP;
+
+        const from = new THREE.Vector3(fromCol.xOffset, fromY + 0.2, 0);
+        const to = new THREE.Vector3(toCol.xOffset, 0.2, 0);
+        const tintCol = this.TIMELINE_COLORS[data.toTlId % this.TIMELINE_COLORS.length];
+
+        // Fade based on depth
+        const opacityScale = Math.max(0.2, 1 - depthSinceBranch * 0.08);
+        this.branchLineGroup.add(Board3DManager._glowTube(from, to, tintCol, 0.04, 0.18, true, opacityScale));
+
+      } else if (data.type === 'cross' && data.square) {
+        // Cross-timeline: horizontal line at current board height
+        const pos = this._fromSq(data.square);
+        const sqX = pos.c - 3.5;
+        const sqZ = pos.r - 3.5;
+
+        // Calculate depth based on how many snapshots have been added since cross move
+        const currentDepth = fromCol.historyLayers.length;
+        const depthSinceCross = currentDepth - data.fromTurn;
+
+        // If more moves have happened, the cross-timeline move is now in history
+        let fromY = 0.3;  // Current board
+        if (depthSinceCross > 0) {
+          fromY = -(depthSinceCross) * TimelineCol.LAYER_GAP + 0.2;
+        }
+
+        const from = new THREE.Vector3(fromCol.xOffset + sqX, fromY, sqZ);
+        const to = new THREE.Vector3(toCol.xOffset + sqX, fromY, sqZ);
+
+        const color = 0xaa44ff;  // Purple
+        const opacityScale = Math.max(0.2, 1 - depthSinceCross * 0.08);
+        this.branchLineGroup.add(Board3DManager._glowTube(from, to, color, 0.03, 0.12, true, opacityScale));
+
+      } else if (data.type === 'timetravel' && data.square !== undefined && data.targetTurnIndex !== undefined) {
+        // Time travel: vertical line down then horizontal to new timeline
+        const pos = this._fromSq(data.square);
+        const sqX = pos.c - 3.5;
+        const sqZ = pos.r - 3.5;
+
+        // Calculate how many snapshots have been added since the time travel
+        const currentDepth = fromCol.historyLayers.length;
+        const depthSinceTravel = currentDepth - data.fromTurn;
+
+        // Start Y: if more moves have happened, start position is in history
+        let startY = 0.3;  // Current board
+        if (depthSinceTravel > 0) {
+          startY = -(depthSinceTravel) * TimelineCol.LAYER_GAP + 0.2;
+        }
+
+        // Target Y: the target turn index plus the offset from new snapshots
+        const adjustedTargetIndex = data.targetTurnIndex + depthSinceTravel + 1;
+        const targetY = -(adjustedTargetIndex + 1) * TimelineCol.LAYER_GAP + 0.2;
+
+        const start = new THREE.Vector3(fromCol.xOffset + sqX, startY, sqZ);
+        const mid = new THREE.Vector3(fromCol.xOffset + sqX, targetY, sqZ);
+        const end = new THREE.Vector3(toCol.xOffset + sqX, 0.3, sqZ);
+
+        const color = 0x44ffaa;  // Cyan-green
+        const opacityScale = Math.max(0.2, 1 - depthSinceTravel * 0.08);
+
+        // Vertical line down through time
+        this.branchLineGroup.add(Board3DManager._glowTube(start, mid, color, 0.03, 0.12, false, opacityScale));
+
+        // Horizontal line to new timeline
+        this.branchLineGroup.add(Board3DManager._glowTube(mid, end, color, 0.03, 0.12, true, opacityScale));
+      }
+    }
+  }
+
+  /** Notify that a timeline's snapshots have changed - triggers branch line rebuild */
+  notifySnapshotAdded(timelineId: number): void {
+    // Rebuild branch lines whenever any timeline gets a new snapshot
+    // This ensures lines stay connected to the correct history layers
+    this._rebuildBranchLines();
   }
 
   setActiveTimeline(id: number): void {
@@ -1936,6 +2048,8 @@ class Board3DManager implements IBoard3D {
         this.branchLineGroup.remove(this.branchLineGroup.children[0]);
       }
     }
+    // Clear branch line metadata
+    this._branchLineData = [];
     this.controls?.target.set(0, 0, 0);
     // Clear mesh pool when resetting game
     meshPool.clear();
