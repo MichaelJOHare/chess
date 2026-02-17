@@ -114,6 +114,10 @@ export interface ITimelineCol {
   getAllSquareMeshes(): THREE.Mesh[];
   clearAll(): void;
   destroy(): void;
+  markBranchDrawn(snapshotIndex: number): void;
+  hasBranchDrawn(snapshotIndex: number): boolean;
+  showCrossTimelineTarget(sq: string, isCapture: boolean): void;
+  clearCrossTimelineTargets(): void;
 }
 
 // ===============================================================
