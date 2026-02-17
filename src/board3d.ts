@@ -1,0 +1,1041 @@
+/* Three.js 6D Chess - multiverse with timeline branching */
+
+// THREE.js is loaded from CDN as a global - we just use the types from @types/three
+import type {
+  Scene, PerspectiveCamera, WebGLRenderer, Raycaster, Vector2, Vector3, Clock,
+  Group, Mesh, Sprite, Points, Material, MeshStandardMaterial, SpriteMaterial,
+  Texture, Object3D, BufferAttribute, Color, BoxGeometry, Curve
+} from 'three';
+
+import type {
+  Board,
+  ChessMove,
+  HighlightEntry,
+  PieceCharMap,
+  TextureCache,
+  FocusTween,
+  PanKeyState,
+  ITimelineCol,
+  IBoard3D,
+} from './types';
+
+// OrbitControls from CDN is attached to global THREE
+interface OrbitControlsInstance {
+  enableDamping: boolean;
+  dampingFactor: number;
+  rotateSpeed: number;
+  panSpeed: number;
+  zoomSpeed: number;
+  minDistance: number;
+  maxDistance: number;
+  maxPolarAngle: number;
+  target: Vector3;
+  screenSpacePanning: boolean;
+  update(): void;
+}
+
+// Declare THREE as a global (loaded from CDN)
+declare const THREE: typeof import('three') & {
+  OrbitControls: new (camera: PerspectiveCamera, domElement: HTMLElement) => OrbitControlsInstance;
+};
+
+// ===============================================================
+// TimelineCol - one per timeline
+// ===============================================================
+
+export class TimelineCol implements ITimelineCol {
+  static readonly LAYER_GAP = 2.8;
+  static readonly MAX_LAYERS = 12;
+
+  private scene: Scene;
+  id: number;
+  xOffset: number;
+  private tint: number;
+  private _texCache: TextureCache;
+  private _pieceChars: PieceCharMap;
+  private _pieceTex: (char: string, isWhite: boolean) => Texture;
+
+  group: Group;
+  private squareMeshes: Mesh[] = [];
+  private pieceMeshes: Sprite[] = [];
+  private highlightMeshes: HighlightEntry[] = [];
+  private lastMoveHL: Mesh[] = [];
+  private historyLayers: Group[] = [];
+  private historySquareMeshes: Mesh[] = [];
+  private moveLineGroup: Group;
+  interLayerGroup: Group;
+
+  constructor(
+    scene: Scene,
+    id: number,
+    xOffset: number,
+    tintColor: number,
+    texCache: TextureCache,
+    pieceChars: PieceCharMap,
+    pieceTex: (char: string, isWhite: boolean) => Texture
+  ) {
+    this.scene = scene;
+    this.id = id;
+    this.xOffset = xOffset;
+    this.tint = tintColor;
+    this._texCache = texCache;
+    this._pieceChars = pieceChars;
+    this._pieceTex = pieceTex;
+
+    this.group = new THREE.Group();
+    this.group.position.x = xOffset;
+
+    this.moveLineGroup = new THREE.Group();
+    this.interLayerGroup = new THREE.Group();
+    this.group.add(this.moveLineGroup);
+    this.group.add(this.interLayerGroup);
+
+    this._buildBoard();
+    scene.add(this.group);
+  }
+
+  private _toSq(r: number, c: number): string {
+    return String.fromCharCode(97 + c) + (8 - r);
+  }
+
+  private _fromSq(sq: string): { r: number; c: number } {
+    return { r: 8 - parseInt(sq[1]), c: sq.charCodeAt(0) - 97 };
+  }
+
+  private _sqToWorld(sq: string, y?: number): Vector3 {
+    const p = this._fromSq(sq);
+    return new THREE.Vector3(p.c - 3.5 + this.xOffset, y || 0, p.r - 3.5);
+  }
+
+  /* board base + squares */
+  private _buildBoard(): void {
+    // Base board - lowered to prevent z-fighting with square bottoms when viewed from below
+    const base = new THREE.Mesh(
+      new THREE.BoxGeometry(8.6, 0.18, 8.6),
+      new THREE.MeshStandardMaterial({ color: 0x15152a, metalness: 0.7, roughness: 0.3 })
+    );
+    base.position.y = -0.16;  // Lowered from -0.14 to create gap with square bottoms
+    base.receiveShadow = true;
+    this.group.add(base);
+
+    const trim = new THREE.Mesh(
+      new THREE.BoxGeometry(8.8, 0.06, 8.8),
+      new THREE.MeshStandardMaterial({ color: 0x333366, metalness: 0.9, roughness: 0.2 })
+    );
+    trim.position.y = -0.28;  // Lowered from -0.24 to stay below base
+    this.group.add(trim);
+
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const isLight = (r + c) % 2 === 0;
+        const mat = new THREE.MeshStandardMaterial({
+          color: isLight ? 0x7575a8 : 0x44446e,
+          metalness: 0.15,
+          roughness: 0.75,
+        });
+        const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.96, 0.07, 0.96), mat);
+        mesh.position.set(c - 3.5, 0, r - 3.5);
+        mesh.receiveShadow = true;
+        mesh.userData = {
+          square: this._toSq(r, c),
+          row: r,
+          col: c,
+          origColor: mat.color.getHex(),
+          timelineId: this.id,
+          turn: -1,
+        };
+        this.squareMeshes.push(mesh);
+        this.group.add(mesh);
+      }
+    }
+
+    this._addLabels();
+  }
+
+  private _addLabels(): void {
+    const files = 'abcdefgh';
+    for (let i = 0; i < 8; i++) {
+      const f = Board3DManager._textSprite(files[i], '#7777aa');
+      f.position.set(i - 3.5, 0.05, 4.4);
+      f.scale.set(0.35, 0.35, 0.35);
+      this.group.add(f);
+      const rk = Board3DManager._textSprite(String(8 - i), '#7777aa');
+      rk.position.set(-4.4, 0.05, i - 3.5);
+      rk.scale.set(0.35, 0.35, 0.35);
+      this.group.add(rk);
+    }
+  }
+
+  /* render pieces on current board */
+  render(position: Board): void {
+    for (let i = 0; i < this.pieceMeshes.length; i++) {
+      this.group.remove(this.pieceMeshes[i]);
+    }
+    this.pieceMeshes = [];
+
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const piece = position[r][c];
+        if (!piece) continue;
+        const isW = piece.color === 'w';
+        const chKey = isW ? piece.type.toUpperCase() : piece.type;
+        const tex = this._pieceTex(this._pieceChars[chKey], isW);
+        const sprite = new THREE.Sprite(
+          new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false })
+        );
+        sprite.position.set(c - 3.5, 0.38, r - 3.5);
+        sprite.scale.set(0.88, 0.88, 0.88);
+        this.pieceMeshes.push(sprite);
+        this.group.add(sprite);
+      }
+    }
+  }
+
+  /* highlight / selection */
+  select(sq: string): void {
+    this.clearHighlights();
+    const pos = this._fromSq(sq);
+    const m = this.squareMeshes[pos.r * 8 + pos.c];
+    (m.material as MeshStandardMaterial).color.setHex(0xbba030);
+    (m.material as MeshStandardMaterial).emissive = new THREE.Color(0x554410);
+    this.highlightMeshes.push({ type: 'sq', mesh: m });
+  }
+
+  showLegalMoves(moves: ChessMove[], position: Board): void {
+    for (let i = 0; i < moves.length; i++) {
+      const p = this._fromSq(moves[i].to);
+      const hasPiece = position[p.r][p.c] !== null;
+      const geo = hasPiece
+        ? new THREE.RingGeometry(0.34, 0.44, 32)
+        : new THREE.CircleGeometry(0.14, 32);
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xffdd44,
+        transparent: true,
+        opacity: 0.5,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      const ind = new THREE.Mesh(geo, mat);
+      ind.rotation.x = -Math.PI / 2;
+      ind.position.set(p.c - 3.5, 0.06, p.r - 3.5);
+      this.group.add(ind);
+      this.highlightMeshes.push({ type: 'ind', mesh: ind });
+    }
+  }
+
+  showLastMove(from: string, to: string): void {
+    for (let i = 0; i < this.lastMoveHL.length; i++) {
+      this.group.remove(this.lastMoveHL[i]);
+    }
+    this.lastMoveHL = [];
+    const sqs = [from, to];
+    for (let i = 0; i < 2; i++) {
+      const pos = this._fromSq(sqs[i]);
+      const pl = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.96, 0.96),
+        new THREE.MeshBasicMaterial({
+          color: 0x4488ff,
+          transparent: true,
+          opacity: 0.15,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        })
+      );
+      pl.rotation.x = -Math.PI / 2;
+      pl.position.set(pos.c - 3.5, 0.055, pos.r - 3.5);
+      this.group.add(pl);
+      this.lastMoveHL.push(pl);
+    }
+  }
+
+  clearHighlights(): void {
+    for (let i = 0; i < this.highlightMeshes.length; i++) {
+      const h = this.highlightMeshes[i];
+      if (h.type === 'sq') {
+        (h.mesh.material as MeshStandardMaterial).color.setHex(
+          h.mesh.userData.origColor as number
+        );
+        (h.mesh.material as MeshStandardMaterial).emissive = new THREE.Color(0);
+      } else {
+        this.group.remove(h.mesh);
+      }
+    }
+    this.highlightMeshes = [];
+  }
+
+  /* persistent move lines on current board */
+  addMoveLine(fromSq: string, toSq: string, isWhite: boolean): void {
+    const a = this._sqToWorld(fromSq, 0.09);
+    const b = this._sqToWorld(toSq, 0.09);
+    a.x -= this.xOffset;
+    b.x -= this.xOffset;
+    const col = isWhite ? 0x4488ff : 0xff7744;
+    this.moveLineGroup.add(Board3DManager._glowTube(a, b, col, 0.018, 0.07, false));
+  }
+
+  /* history snapshot */
+  addSnapshot(position: Board, moveFrom: string, moveTo: string, isWhite: boolean): void {
+    const layerGroup = this._makeHistoryBoard(position);
+    layerGroup.userData = { moveFrom, moveTo, isWhite };
+    this.historyLayers.unshift(layerGroup);
+    this.group.add(layerGroup);
+
+    while (this.historyLayers.length > TimelineCol.MAX_LAYERS) {
+      const old = this.historyLayers.pop()!;
+      this._removeHistorySquares(old);
+      this.group.remove(old);
+    }
+    this._layoutLayers();
+  }
+
+  private _makeHistoryBoard(position: Board): Group {
+    const g = new THREE.Group();
+    const turnIndex = this.historyLayers.length;
+    const sqMeshes: Mesh[] = [];
+
+    const base = new THREE.Mesh(
+      new THREE.BoxGeometry(8.2, 0.03, 8.2),
+      new THREE.MeshStandardMaterial({
+        color: 0x15152a,
+        transparent: true,
+        opacity: 0.25,
+        metalness: 0.5,
+        roughness: 0.5,
+      })
+    );
+    base.position.y = -0.02;
+    g.add(base);
+
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const isLight = (r + c) % 2 === 0;
+        const m = new THREE.Mesh(
+          new THREE.BoxGeometry(0.93, 0.025, 0.93),
+          new THREE.MeshStandardMaterial({
+            color: isLight ? 0x7575a8 : 0x44446e,
+            transparent: true,
+            opacity: 0.2,
+            metalness: 0.15,
+            roughness: 0.8,
+          })
+        );
+        m.position.set(c - 3.5, 0, r - 3.5);
+        m.userData = {
+          square: this._toSq(r, c),
+          row: r,
+          col: c,
+          origColor: (m.material as MeshStandardMaterial).color.getHex(),
+          timelineId: this.id,
+          turn: turnIndex,
+          isHistory: true,
+        };
+        g.add(m);
+        sqMeshes.push(m);
+      }
+    }
+
+    // Pieces
+    for (let r2 = 0; r2 < 8; r2++) {
+      for (let c2 = 0; c2 < 8; c2++) {
+        const piece = position[r2][c2];
+        if (!piece) continue;
+        const isW = piece.color === 'w';
+        const chKey = isW ? piece.type.toUpperCase() : piece.type;
+        const tex = this._pieceTex(this._pieceChars[chKey], isW);
+        const sp = new THREE.Sprite(
+          new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0.35, depthWrite: false })
+        );
+        sp.position.set(c2 - 3.5, 0.25, r2 - 3.5);
+        sp.scale.set(0.7, 0.7, 0.7);
+        g.add(sp);
+      }
+    }
+
+    g.userData.sqMeshes = sqMeshes;
+    this.historySquareMeshes = this.historySquareMeshes.concat(sqMeshes);
+    return g;
+  }
+
+  private _removeHistorySquares(layerGroup: Group): void {
+    const toRemove = (layerGroup.userData.sqMeshes as Mesh[]) || [];
+    this.historySquareMeshes = this.historySquareMeshes.filter((m) => toRemove.indexOf(m) === -1);
+  }
+
+  private _layoutLayers(): void {
+    for (let i = 0; i < this.historyLayers.length; i++) {
+      this.historyLayers[i].position.y = -(i + 1) * TimelineCol.LAYER_GAP;
+      const op = Math.max(0.06, 0.38 - i * 0.025);
+      this._setGroupOpacity(this.historyLayers[i], op);
+      // Update turn indices for history squares
+      const sqs = (this.historyLayers[i].userData.sqMeshes as Mesh[]) || [];
+      for (let j = 0; j < sqs.length; j++) {
+        sqs[j].userData.turn = i;
+      }
+    }
+
+    // Rebuild inter-layer lines
+    while (this.interLayerGroup.children.length) {
+      this.interLayerGroup.remove(this.interLayerGroup.children[0]);
+    }
+
+    for (let j = 0; j < this.historyLayers.length; j++) {
+      const layer = this.historyLayers[j];
+      const fromSq = layer.userData.moveFrom as string;
+      const toSq = layer.userData.moveTo as string;
+      const isW = layer.userData.isWhite as boolean;
+
+      const fromY = layer.position.y + 0.1;
+      const toY = j === 0 ? 0.1 : this.historyLayers[j - 1].position.y + 0.1;
+      const fromW = new THREE.Vector3().copy(this._sqToWorld(fromSq, fromY));
+      const toW = new THREE.Vector3().copy(this._sqToWorld(toSq, toY));
+      fromW.x -= this.xOffset;
+      toW.x -= this.xOffset;
+      const lineCol = isW ? 0x44ddff : 0xffaa33;
+      this.interLayerGroup.add(Board3DManager._glowTube(fromW, toW, lineCol, 0.025, 0.1, true));
+    }
+  }
+
+  private _setGroupOpacity(group: Group, opacity: number): void {
+    group.traverse((child: Object3D) => {
+      const obj = child as Mesh | Sprite;
+      if (obj.material && (obj.material as Material).transparent) {
+        (obj.material as Material).opacity = (child as Sprite).isSprite
+          ? opacity * 1.1
+          : opacity;
+      }
+    });
+  }
+
+  getAllSquareMeshes(): Mesh[] {
+    return this.squareMeshes.concat(this.historySquareMeshes);
+  }
+
+  setActive(active: boolean): void {
+    this.group.children.forEach((child) => {
+      const mesh = child as Mesh;
+      if (
+        mesh.geometry &&
+        (mesh.geometry as BoxGeometry).type === 'BoxGeometry' &&
+        (mesh.geometry as BoxGeometry).parameters.width > 8.5 &&
+        mesh.position.y < -0.1
+      ) {
+        (mesh.material as MeshStandardMaterial).emissive = active
+          ? new THREE.Color(0x222244)
+          : new THREE.Color(0);
+      }
+    });
+  }
+
+  setHighlighted(highlighted: boolean): void {
+    this.group.children.forEach((child) => {
+      const mesh = child as Mesh;
+      if (
+        mesh.geometry &&
+        (mesh.geometry as BoxGeometry).type === 'BoxGeometry' &&
+        (mesh.geometry as BoxGeometry).parameters.width > 8.5 &&
+        mesh.position.y < -0.1
+      ) {
+        if (highlighted) {
+          (mesh.material as MeshStandardMaterial).emissive = new THREE.Color(0x446688);
+        } else {
+          (mesh.material as MeshStandardMaterial).emissive = new THREE.Color(0);
+        }
+      }
+    });
+  }
+
+  clearAll(): void {
+    for (let i = 0; i < this.historyLayers.length; i++) {
+      this.group.remove(this.historyLayers[i]);
+    }
+    this.historyLayers = [];
+    this.historySquareMeshes = [];
+    while (this.moveLineGroup.children.length) {
+      this.moveLineGroup.remove(this.moveLineGroup.children[0]);
+    }
+    while (this.interLayerGroup.children.length) {
+      this.interLayerGroup.remove(this.interLayerGroup.children[0]);
+    }
+    this.clearHighlights();
+    for (let i = 0; i < this.lastMoveHL.length; i++) {
+      this.group.remove(this.lastMoveHL[i]);
+    }
+    this.lastMoveHL = [];
+  }
+
+  destroy(): void {
+    this.clearAll();
+    this.scene.remove(this.group);
+  }
+}
+
+// ===============================================================
+// Board3D - scene manager, coordinates multiple timelines
+// ===============================================================
+
+class Board3DManager implements IBoard3D {
+  scene: Scene | null = null;
+  camera: PerspectiveCamera | null = null;
+  renderer: WebGLRenderer | null = null;
+  controls: OrbitControlsInstance | null = null;
+  private raycaster: Raycaster | null = null;
+  private mouse: Vector2 | null = null;
+  private container: HTMLElement | null = null;
+  private _clock: Clock | null = null;
+  private _downPos: { x: number; y: number } | null = null;
+  private _texCache: TextureCache = {};
+
+  timelineCols: Record<number, TimelineCol> = {};
+  private branchLineGroup: Group | null = null;
+  private particleSystem: Points | null = null;
+  private onSquareClick:
+    | ((info: { timelineId: number; square: string; turn: number; isHistory: boolean }) => void)
+    | null = null;
+
+  private _panKeys: PanKeyState = { w: false, a: false, s: false, d: false, q: false, e: false };
+  private _panSpeed = 0.12;  // Slowed down from 0.25 for smoother control
+  private _zoomSpeed = 0.4;
+  private _focusTween: FocusTween | undefined;
+
+  readonly PIECE_CHARS: PieceCharMap = {
+    K: '\u2654',
+    Q: '\u2655',
+    R: '\u2656',
+    B: '\u2657',
+    N: '\u2658',
+    P: '\u2659',
+    k: '\u265A',
+    q: '\u265B',
+    r: '\u265C',
+    b: '\u265D',
+    n: '\u265E',
+    p: '\u265F',
+  };
+
+  readonly TIMELINE_COLORS: number[] = [
+    0x44ddff, 0xff66aa, 0x66ff88, 0xffaa33, 0xaa66ff, 0xff4444, 0x44ffcc, 0xffff44,
+  ];
+  readonly TIMELINE_SPACING = 12;
+
+  init(
+    containerId: string,
+    onSquareClick: (info: { timelineId: number; square: string; turn: number; isHistory: boolean }) => void
+  ): void {
+    this.onSquareClick = onSquareClick;
+    const container = document.getElementById(containerId);
+    if (!container) {
+      throw new Error(`Container element '${containerId}' not found`);
+    }
+    this.container = container;
+    this._clock = new THREE.Clock();
+    this.raycaster = new THREE.Raycaster();
+    this.mouse = new THREE.Vector2();
+
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
+    this.renderer.setClearColor(0x080818);
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.container.appendChild(this.renderer.domElement);
+
+    this.scene = new THREE.Scene();
+    this.scene.fog = new THREE.FogExp2(0x080818, 0.008);
+
+    const aspect = this.container.clientWidth / this.container.clientHeight;
+    this.camera = new THREE.PerspectiveCamera(50, aspect, 0.1, 300);
+    this.camera.position.set(0, 14, 12);
+
+    // Use global THREE.OrbitControls from CDN
+    const controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.rotateSpeed = 0.7;
+    controls.panSpeed = 0.8;
+    controls.zoomSpeed = 1.2;
+    controls.minDistance = 5;
+    controls.maxDistance = 80;
+    controls.maxPolarAngle = Math.PI * 0.85;
+    controls.target.set(0, 0, 0);
+    controls.screenSpacePanning = true;
+    this.controls = controls;
+
+    this._setupLights();
+    this.branchLineGroup = new THREE.Group();
+    this.scene.add(this.branchLineGroup);
+    this._createFloor();
+    this._createParticles();
+
+    this.renderer.domElement.addEventListener('pointerdown', (e: PointerEvent) => {
+      this._downPos = { x: e.clientX, y: e.clientY };
+    });
+    this.renderer.domElement.addEventListener('pointerup', (e: PointerEvent) => {
+      if (!this._downPos) return;
+      const dx = e.clientX - this._downPos.x;
+      const dy = e.clientY - this._downPos.y;
+      if (dx * dx + dy * dy < 36) this._onClick(e);
+      this._downPos = null;
+    });
+    window.addEventListener('resize', () => this._onResize());
+
+    // WASD keyboard panning
+    window.addEventListener('keydown', (e: KeyboardEvent) => this._onKeyDown(e));
+    window.addEventListener('keyup', (e: KeyboardEvent) => this._onKeyUp(e));
+
+    this._animate();
+  }
+
+  /* create / get timeline */
+  createTimeline(id: number, xOffset: number): TimelineCol {
+    const col = new TimelineCol(
+      this.scene!,
+      id,
+      xOffset,
+      this.TIMELINE_COLORS[id % this.TIMELINE_COLORS.length],
+      this._texCache,
+      this.PIECE_CHARS,
+      this._pieceTexture.bind(this)
+    );
+    this.timelineCols[id] = col;
+    return col;
+  }
+
+  getTimeline(id: number): TimelineCol | undefined {
+    return this.timelineCols[id];
+  }
+
+  removeTimeline(id: number): void {
+    if (this.timelineCols[id]) {
+      this.timelineCols[id].destroy();
+      delete this.timelineCols[id];
+    }
+  }
+
+  /* add a glow branch line between two timelines */
+  addBranchLine(fromTlId: number, fromTurn: number, toTlId: number): void {
+    const fromCol = this.timelineCols[fromTlId];
+    const toCol = this.timelineCols[toTlId];
+    if (!fromCol || !toCol || !this.branchLineGroup) return;
+
+    const fromY = -(fromTurn + 1) * TimelineCol.LAYER_GAP;
+    const from = new THREE.Vector3(fromCol.xOffset, fromY + 0.2, 0);
+    const to = new THREE.Vector3(toCol.xOffset, 0.2, 0);
+    const tintCol = this.TIMELINE_COLORS[toTlId % this.TIMELINE_COLORS.length];
+    this.branchLineGroup.add(Board3DManager._glowTube(from, to, tintCol, 0.04, 0.18, true));
+  }
+
+  setActiveTimeline(id: number): void {
+    for (const key in this.timelineCols) {
+      this.timelineCols[key].setActive(parseInt(key) === id);
+    }
+  }
+
+  /* Smoothly pan camera to center on a timeline */
+  focusTimeline(id: number, animate: boolean): void {
+    const col = this.timelineCols[id];
+    if (!col || !this.controls || !this.camera || !this._clock) return;
+
+    const targetX = col.xOffset;
+    const currentTarget = this.controls.target.clone();
+    const newTarget = new THREE.Vector3(targetX, 0, 0);
+
+    if (animate) {
+      const startTime = this._clock.getElapsedTime();
+      const duration = 0.4;
+
+      this._focusTween = {
+        start: currentTarget,
+        end: newTarget,
+        startTime,
+        duration,
+      };
+    } else {
+      const delta = new THREE.Vector3().subVectors(newTarget, currentTarget);
+      this.controls.target.add(delta);
+      this.camera.position.add(delta);
+    }
+  }
+
+  /* Update focus animation in render loop */
+  private _updateFocusAnimation(): void {
+    if (!this._focusTween || !this._clock || !this.controls || !this.camera) return;
+
+    const t = this._clock.getElapsedTime();
+    const elapsed = t - this._focusTween.startTime;
+    const progress = Math.min(elapsed / this._focusTween.duration, 1);
+
+    // Ease out cubic
+    const eased = 1 - Math.pow(1 - progress, 3);
+
+    const newTarget = new THREE.Vector3().lerpVectors(
+      this._focusTween.start,
+      this._focusTween.end,
+      eased
+    );
+
+    const delta = new THREE.Vector3().subVectors(newTarget, this.controls.target);
+    this.controls.target.add(delta);
+    this.camera.position.add(delta);
+
+    if (progress >= 1) {
+      this._focusTween = undefined;
+    }
+  }
+
+  /* Lights */
+  private _setupLights(): void {
+    if (!this.scene) return;
+    this.scene.add(new THREE.AmbientLight(0x404060, 0.5));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.7);
+    dir.position.set(5, 15, 8);
+    dir.castShadow = true;
+    dir.shadow.mapSize.set(2048, 2048);
+    dir.shadow.camera.left = -20;
+    dir.shadow.camera.right = 20;
+    dir.shadow.camera.top = 20;
+    dir.shadow.camera.bottom = -20;
+    dir.shadow.camera.near = 1;
+    dir.shadow.camera.far = 60;
+    this.scene.add(dir);
+    const p1 = new THREE.PointLight(0x4466ff, 0.5, 50);
+    p1.position.set(-12, 8, -8);
+    this.scene.add(p1);
+    const p2 = new THREE.PointLight(0xff6644, 0.35, 50);
+    p2.position.set(12, 8, 8);
+    this.scene.add(p2);
+  }
+
+  private _createFloor(): void {
+    // Removed grid floor that was causing visual artifacts between boards
+    // The dark background is sufficient for the cosmic aesthetic
+  }
+
+  private _createParticles(): void {
+    if (!this.scene) return;
+    const n = 400;
+    const pos = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      pos[i * 3] = (Math.random() - 0.5) * 70;
+      pos[i * 3 + 1] = Math.random() * 30 - 10;
+      pos[i * 3 + 2] = (Math.random() - 0.5) * 70;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    this.particleSystem = new THREE.Points(
+      geo,
+      new THREE.PointsMaterial({
+        color: 0x6688cc,
+        size: 0.07,
+        transparent: true,
+        opacity: 0.5,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      })
+    );
+    this.scene.add(this.particleSystem);
+  }
+
+  /* piece texture factory */
+  private _pieceTexture(symbol: string, isWhite: boolean): Texture {
+    const key = symbol + (isWhite ? 'w' : 'b');
+    if (this._texCache[key]) return this._texCache[key];
+    const s = 256;
+    const cv = document.createElement('canvas');
+    cv.width = s;
+    cv.height = s;
+    const ctx = cv.getContext('2d')!;
+    ctx.clearRect(0, 0, s, s);
+    ctx.font = s * 0.78 + 'px serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    if (isWhite) {
+      ctx.shadowColor = 'rgba(0,0,0,0.5)';
+      ctx.shadowBlur = 6;
+      ctx.fillStyle = '#f0ece0';
+      ctx.fillText(symbol, s / 2, s / 2);
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = 'rgba(40,30,10,0.25)';
+      ctx.lineWidth = 1.5;
+      ctx.strokeText(symbol, s / 2, s / 2);
+    } else {
+      ctx.shadowColor = 'rgba(80,80,140,0.5)';
+      ctx.shadowBlur = 8;
+      ctx.fillStyle = '#303048';
+      ctx.fillText(symbol, s / 2, s / 2);
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = '#aaaacc';
+      ctx.lineWidth = 2.5;
+      ctx.strokeText(symbol, s / 2, s / 2);
+    }
+    const tex = new THREE.CanvasTexture(cv);
+    this._texCache[key] = tex;
+    return tex;
+  }
+
+  /* text sprite helper */
+  static _textSprite(text: string, color: string): Sprite {
+    const c = document.createElement('canvas');
+    c.width = 64;
+    c.height = 64;
+    const ctx = c.getContext('2d')!;
+    ctx.font = 'bold 48px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = color;
+    ctx.fillText(text, 32, 32);
+    return new THREE.Sprite(
+      new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), transparent: true })
+    );
+  }
+
+  /* glow tube (static helper) */
+  static _glowTube(
+    from: Vector3,
+    to: Vector3,
+    color: number,
+    coreR: number,
+    glowR: number,
+    arc: boolean
+  ): Group {
+    const group = new THREE.Group();
+    let curve: Curve<Vector3>;
+    if (arc) {
+      const mid = new THREE.Vector3().lerpVectors(from, to, 0.5);
+      const hDir = new THREE.Vector2(mid.x, mid.z);
+      const hLen = hDir.length();
+      if (hLen > 0.01) {
+        hDir.normalize();
+        mid.x += hDir.x * 0.7;
+        mid.z += hDir.y * 0.7;
+      }
+      curve = new THREE.QuadraticBezierCurve3(from, mid, to);
+    } else {
+      curve = new THREE.LineCurve3(from, to);
+    }
+    const segs = arc ? 24 : 8;
+
+    group.add(
+      new THREE.Mesh(
+        new THREE.TubeGeometry(curve, segs, glowR, 8, false),
+        new THREE.MeshBasicMaterial({
+          color,
+          transparent: true,
+          opacity: 0.1,
+          blending: THREE.AdditiveBlending,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        })
+      )
+    );
+    group.add(
+      new THREE.Mesh(
+        new THREE.TubeGeometry(curve, segs, glowR * 0.45, 8, false),
+        new THREE.MeshBasicMaterial({
+          color,
+          transparent: true,
+          opacity: 0.22,
+          blending: THREE.AdditiveBlending,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        })
+      )
+    );
+    group.add(
+      new THREE.Mesh(
+        new THREE.TubeGeometry(curve, segs, coreR, 8, false),
+        new THREE.MeshBasicMaterial({
+          color: 0xffffff,
+          transparent: true,
+          opacity: 0.75,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        })
+      )
+    );
+
+    const sg = new THREE.SphereGeometry(coreR * 2.2, 12, 12);
+    const sm = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.6,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    const s1 = new THREE.Mesh(sg, sm);
+    s1.position.copy(from);
+    group.add(s1);
+    const s2 = new THREE.Mesh(sg.clone(), sm.clone());
+    s2.position.copy(to);
+    group.add(s2);
+    return group;
+  }
+
+  /* WASD keyboard panning handlers */
+  private _onKeyDown(e: KeyboardEvent): void {
+    // Don't capture if typing in an input
+    if (
+      e.target instanceof HTMLInputElement ||
+      e.target instanceof HTMLTextAreaElement
+    ) {
+      return;
+    }
+
+    const key = e.key.toLowerCase() as keyof PanKeyState;
+    if (key === 'w' || key === 'a' || key === 's' || key === 'd' || key === 'q' || key === 'e') {
+      e.preventDefault();
+      this._panKeys[key] = true;
+    }
+  }
+
+  private _onKeyUp(e: KeyboardEvent): void {
+    const key = e.key.toLowerCase() as keyof PanKeyState;
+    if (key === 'w' || key === 'a' || key === 's' || key === 'd' || key === 'q' || key === 'e') {
+      this._panKeys[key] = false;
+    }
+  }
+
+  private _updatePanning(): void {
+    if (!this._panKeys || !this.camera || !this.controls) return;
+
+    let panX = 0;
+    let panZ = 0;
+    if (this._panKeys.w) panZ -= this._panSpeed;
+    if (this._panKeys.s) panZ += this._panSpeed;
+    if (this._panKeys.a) panX -= this._panSpeed;
+    if (this._panKeys.d) panX += this._panSpeed;
+
+    if (panX !== 0 || panZ !== 0) {
+      // Get camera's forward and right vectors projected onto XZ plane
+      const forward = new THREE.Vector3();
+      this.camera.getWorldDirection(forward);
+      forward.y = 0;
+      forward.normalize();
+
+      const right = new THREE.Vector3();
+      right.crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+
+      // Calculate movement
+      const move = new THREE.Vector3();
+      move.addScaledVector(forward, -panZ);
+      move.addScaledVector(right, panX);
+
+      // Apply to both camera and target
+      this.camera.position.add(move);
+      this.controls.target.add(move);
+    }
+
+    // Q/E keyboard zoom
+    if (this._panKeys.q || this._panKeys.e) {
+      const zoomDir = this._panKeys.e ? -1 : 1; // E = zoom in, Q = zoom out
+      const direction = new THREE.Vector3();
+      direction.subVectors(this.camera.position, this.controls.target).normalize();
+
+      const distance = this.camera.position.distanceTo(this.controls.target);
+      const zoomAmount = this._zoomSpeed * zoomDir;
+
+      // Respect min/max distance
+      const newDistance = distance + zoomAmount;
+      if (newDistance >= this.controls.minDistance && newDistance <= this.controls.maxDistance) {
+        this.camera.position.addScaledVector(direction, zoomAmount);
+      }
+    }
+  }
+
+  /* click -> find which timeline + square (or history square) */
+  private _onClick(event: PointerEvent): void {
+    if (!this.renderer || !this.raycaster || !this.mouse || !this.camera) return;
+
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.mouse, this.camera);
+
+    // Collect all clickable squares across all timelines
+    let allMeshes: Mesh[] = [];
+    for (const key in this.timelineCols) {
+      allMeshes = allMeshes.concat(this.timelineCols[key].getAllSquareMeshes());
+    }
+    const hits = this.raycaster.intersectObjects(allMeshes);
+    if (hits.length > 0 && this.onSquareClick) {
+      const ud = hits[0].object.userData;
+      this.onSquareClick({
+        timelineId: ud.timelineId as number,
+        square: ud.square as string,
+        turn: ud.turn as number,
+        isHistory: !!ud.isHistory,
+      });
+    }
+  }
+
+  private _onResize(): void {
+    if (!this.container || !this.camera || !this.renderer) return;
+    const w = this.container.clientWidth;
+    const h = this.container.clientHeight;
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(w, h);
+  }
+
+  private _animate(): void {
+    requestAnimationFrame(() => this._animate());
+
+    if (!this._clock || !this.controls || !this.renderer || !this.scene || !this.camera) return;
+
+    const t = this._clock.getElapsedTime();
+
+    // Update WASD panning
+    this._updatePanning();
+
+    // Update focus animation
+    this._updateFocusAnimation();
+
+    this.controls.update();
+
+    if (this.particleSystem) {
+      const pa = (this.particleSystem.geometry.attributes.position as BufferAttribute)
+        .array as Float32Array;
+      for (let i = 1; i < pa.length; i += 3) {
+        pa[i] += Math.sin(t * 0.5 + i) * 0.001;
+      }
+      this.particleSystem.geometry.attributes.position.needsUpdate = true;
+      this.particleSystem.rotation.y = t * 0.006;
+    }
+
+    // Pulse branch lines
+    const pulse = 0.7 + 0.3 * Math.sin(t * 2);
+    this.branchLineGroup?.traverse((child: Object3D) => {
+      const mesh = child as Mesh;
+      if (mesh.isMesh && mesh.material && (mesh.material as Material).opacity <= 0.12) {
+        (mesh.material as Material).opacity = 0.1 * pulse;
+      }
+    });
+
+    // Pulse inter-layer lines per timeline
+    for (const key in this.timelineCols) {
+      this.timelineCols[key].interLayerGroup.traverse((child: Object3D) => {
+        const mesh = child as Mesh;
+        if (mesh.isMesh && mesh.material && (mesh.material as Material).opacity <= 0.12) {
+          (mesh.material as Material).opacity = 0.1 * pulse;
+        }
+      });
+    }
+
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  clearAll(): void {
+    for (const key in this.timelineCols) {
+      this.timelineCols[key].destroy();
+    }
+    this.timelineCols = {};
+    if (this.branchLineGroup) {
+      while (this.branchLineGroup.children.length) {
+        this.branchLineGroup.remove(this.branchLineGroup.children[0]);
+      }
+    }
+    this.controls?.target.set(0, 0, 0);
+  }
+}
+
+// Export singleton instance
+export const Board3D = new Board3DManager();
