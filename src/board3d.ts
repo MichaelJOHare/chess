@@ -66,6 +66,7 @@ export class TimelineCol implements ITimelineCol {
   interLayerGroup: Group;
   private crossTimelineTargets: Mesh[] = [];  // Purple highlights for cross-timeline moves
   private timeTravelTargets: Mesh[] = [];     // Cyan-green portals for time travel moves
+  private drawnBranchIndices: Set<number> = new Set();  // Track which snapshot indices have branches drawn
 
   constructor(
     scene: Scene,
@@ -381,6 +382,16 @@ export class TimelineCol implements ITimelineCol {
     this.timeTravelTargets = [];
   }
 
+  /** Mark a snapshot index as having a branch drawn from it */
+  markBranchDrawn(snapshotIndex: number): void {
+    this.drawnBranchIndices.add(snapshotIndex);
+  }
+
+  /** Check if a snapshot index already has a branch drawn */
+  hasBranchDrawn(snapshotIndex: number): boolean {
+    return this.drawnBranchIndices.has(snapshotIndex);
+  }
+
   /* persistent move lines on current board */
   addMoveLine(fromSq: string, toSq: string, isWhite: boolean): void {
     const a = this._sqToWorld(fromSq, 0.09);
@@ -431,9 +442,9 @@ export class TimelineCol implements ITimelineCol {
         const m = new THREE.Mesh(
           new THREE.BoxGeometry(0.93, 0.025, 0.93),
           new THREE.MeshStandardMaterial({
-            color: isLight ? 0x7575a8 : 0x44446e,
+            color: isLight ? 0x5a5a88 : 0x38385a,  // Darker colors for history squares
             transparent: true,
-            opacity: 0.2,
+            opacity: 0.15,  // Lower opacity for more prominent grey-out
             metalness: 0.15,
             roughness: 0.8,
           })
@@ -462,7 +473,7 @@ export class TimelineCol implements ITimelineCol {
         const chKey = isW ? piece.type.toUpperCase() : piece.type;
         const tex = this._pieceTex(this._pieceChars[chKey], isW);
         const sp = new THREE.Sprite(
-          new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0.35, depthWrite: false })
+          new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0.25, depthWrite: false })  // Lower opacity for history pieces
         );
         sp.position.set(c2 - 3.5, 0.12, r2 - 3.5);
         sp.scale.set(0.7, 0.7, 0.7);
@@ -483,8 +494,18 @@ export class TimelineCol implements ITimelineCol {
   private _layoutLayers(): void {
     for (let i = 0; i < this.historyLayers.length; i++) {
       this.historyLayers[i].position.y = -(i + 1) * TimelineCol.LAYER_GAP;
-      const op = Math.max(0.06, 0.38 - i * 0.025);
+
+      // Calculate snapshot index for this layer (most recent history is layer 0)
+      // historyLayers[0] corresponds to the most recent snapshot before current
+      const snapshotIndex = this.historyLayers.length - 1 - i;
+      const hasBranch = this.drawnBranchIndices.has(snapshotIndex);
+
+      // More prominent grey-out effect: lower base opacity and faster falloff
+      // Even lower opacity for layers with branches (already explored)
+      const baseOp = hasBranch ? 0.12 : 0.28;
+      const op = Math.max(0.04, baseOp - i * 0.035);
       this._setGroupOpacity(this.historyLayers[i], op);
+
       // Update turn indices for history squares
       const sqs = (this.historyLayers[i].userData.sqMeshes as Mesh[]) || [];
       for (let j = 0; j < sqs.length; j++) {
@@ -502,6 +523,13 @@ export class TimelineCol implements ITimelineCol {
       const fromSq = layer.userData.moveFrom as string;
       const toSq = layer.userData.moveTo as string;
       const isW = layer.userData.isWhite as boolean;
+
+      // Skip drawing inter-layer lines for layers that have branches
+      // (these are already connected to other timelines)
+      const snapshotIndex = this.historyLayers.length - 1 - j;
+      if (this.drawnBranchIndices.has(snapshotIndex)) {
+        continue;
+      }
 
       const fromY = layer.position.y + 0.1;
       const toY = j === 0 ? 0.1 : this.historyLayers[j - 1].position.y + 0.1;
@@ -592,6 +620,7 @@ export class TimelineCol implements ITimelineCol {
     }
     this.historyLayers = [];
     this.historySquareMeshes = [];
+    this.drawnBranchIndices.clear();  // Clear branch tracking
     while (this.moveLineGroup.children.length) {
       this.moveLineGroup.remove(this.moveLineGroup.children[0]);
     }
@@ -864,6 +893,13 @@ class Board3DManager implements IBoard3D {
     const fromCol = this.timelineCols[fromTlId];
     const toCol = this.timelineCols[toTlId];
     if (!fromCol || !toCol || !this.branchLineGroup) return;
+
+    // Skip if this branch point has already been drawn
+    const branchKey = fromTurn;
+    if (fromCol.hasBranchDrawn(branchKey)) {
+      return;
+    }
+    fromCol.markBranchDrawn(branchKey);
 
     const fromY = -(fromTurn + 1) * TimelineCol.LAYER_GAP;
     const from = new THREE.Vector3(fromCol.xOffset, fromY + 0.2, 0);
