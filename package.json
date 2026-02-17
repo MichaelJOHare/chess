@@ -1,0 +1,29 @@
+{
+  "name": "chess",
+  "version": "1.0.0",
+  "description": "6D Chess - multiverse chess with timeline branching",
+  "main": "dist/bundle.js",
+  "scripts": {
+    "build": "node build.js",
+    "watch": "node build.js --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit && echo 'Types OK!'"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nicklaude/chess.git"
+  },
+  "keywords": ["chess", "3d", "three.js", "multiverse"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/nicklaude/chess/issues"
+  },
+  "homepage": "https://github.com/nicklaude/chess#readme",
+  "devDependencies": {
+    "@types/three": "^0.182.0",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.9.3"
+  }
+}
