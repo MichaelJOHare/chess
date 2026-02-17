@@ -15,12 +15,16 @@ body {
     display: flex;
     width: 100vw;
     height: 100vh;
+    overflow: hidden;
+    position: relative;
 }
 
 #scene-container {
     flex: 1;
     position: relative;
     cursor: grab;
+    min-width: 0;
+    overflow: hidden;
 }
 
 #scene-container:active {
@@ -32,6 +36,7 @@ body {
     min-width: 180px;
     max-width: 400px;
     flex-shrink: 0;
+    flex-grow: 0;
     background: rgba(12, 12, 30, 0.95);
     backdrop-filter: blur(12px);
     border-left: 1px solid rgba(80, 80, 160, 0.2);
@@ -41,6 +46,7 @@ body {
     gap: 0.75rem;
     z-index: 10;
     overflow-y: auto;
+    overflow-x: hidden;
     position: relative;
 }
 
@@ -606,9 +612,16 @@ body {
 @media (max-width: 1000px) {
     #sidebar {
         width: 220px;
-        min-width: 220px;
-        max-width: 220px;
+        min-width: 180px;
+        max-width: 280px;
         padding: 1rem;
+    }
+}
+
+/* Ensure sidebar never exceeds viewport on wider screens */
+@media (min-width: 1001px) {
+    #sidebar {
+        max-width: min(350px, 30vw);
     }
 }
 
