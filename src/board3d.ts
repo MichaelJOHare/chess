@@ -543,6 +543,10 @@ class Board3DManager implements IBoard3D {
   private _panSpeed = 0.12;  // Slowed down from 0.25 for smoother control
   private _zoomSpeed = 0.4;
   private _focusTween: FocusTween | undefined;
+  private _resizeTimeout: number | null = null;
+  private _resizeObserver: ResizeObserver | null = null;
+  private _lastContainerWidth = 0;
+  private _lastContainerHeight = 0;
 
   readonly PIECE_CHARS: PieceCharMap = {
     K: '\u2654',
@@ -623,7 +627,16 @@ class Board3DManager implements IBoard3D {
       if (dx * dx + dy * dy < 36) this._onClick(e);
       this._downPos = null;
     });
-    window.addEventListener('resize', () => this._onResize());
+    // Window resize handler with debouncing
+    window.addEventListener('resize', () => this._scheduleResize());
+
+    // ResizeObserver for container size changes (handles sidebar resize, etc.)
+    this._resizeObserver = new ResizeObserver(() => this._scheduleResize());
+    this._resizeObserver.observe(this.container);
+
+    // Store initial dimensions
+    this._lastContainerWidth = this.container.clientWidth;
+    this._lastContainerHeight = this.container.clientHeight;
 
     // WASD keyboard panning
     window.addEventListener('keydown', (e: KeyboardEvent) => this._onKeyDown(e));
@@ -1037,10 +1050,48 @@ class Board3DManager implements IBoard3D {
     }
   }
 
+  /** Schedule a debounced resize to prevent rapid re-renders */
+  private _scheduleResize(): void {
+    if (this._resizeTimeout !== null) {
+      window.clearTimeout(this._resizeTimeout);
+    }
+    this._resizeTimeout = window.setTimeout(() => {
+      this._onResize();
+      this._resizeTimeout = null;
+    }, 50);
+  }
+
   private _onResize(): void {
     if (!this.container || !this.camera || !this.renderer) return;
-    const w = this.container.clientWidth;
-    const h = this.container.clientHeight;
+
+    // Get container dimensions with fallback to parent or window
+    let w = this.container.clientWidth;
+    let h = this.container.clientHeight;
+
+    // Ensure we have valid dimensions (prevent 0-size canvas)
+    if (w <= 0 || h <= 0) {
+      const parent = this.container.parentElement;
+      if (parent) {
+        w = parent.clientWidth - 250; // Account for sidebar
+        h = parent.clientHeight;
+      }
+      // Final fallback to window dimensions
+      if (w <= 0) w = window.innerWidth - 250;
+      if (h <= 0) h = window.innerHeight;
+    }
+
+    // Clamp dimensions to reasonable bounds
+    w = Math.max(100, Math.min(w, window.innerWidth));
+    h = Math.max(100, Math.min(h, window.innerHeight));
+
+    // Only resize if dimensions actually changed
+    if (w === this._lastContainerWidth && h === this._lastContainerHeight) {
+      return;
+    }
+
+    this._lastContainerWidth = w;
+    this._lastContainerHeight = h;
+
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
