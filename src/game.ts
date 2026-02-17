@@ -183,6 +183,18 @@ class GameManager {
       });
     }
 
+    const maxTimelinesSlider = document.getElementById('max-timelines') as HTMLInputElement | null;
+    const maxTimelinesValue = document.getElementById('max-timelines-value');
+    if (maxTimelinesSlider) {
+      maxTimelinesSlider.addEventListener('input', () => {
+        const val = parseInt(maxTimelinesSlider.value);
+        this.setMaxTimelines(val);
+        if (maxTimelinesValue) {
+          maxTimelinesValue.textContent = val.toString();
+        }
+      });
+    }
+
     const cameraToggle = document.getElementById('cpu-camera-toggle');
     if (cameraToggle) {
       cameraToggle.addEventListener('click', () => {
@@ -2053,7 +2065,7 @@ timelines - list timelines`,
   private cpuEnabled = false;
   private cpuTimer: number | null = null;
   private cpuMoveDelay = 400;  // ms between moves (faster for visual effect)
-  private maxTimelines = 100;   // Allow many timelines (was 10)
+  private maxTimelines = 10;   // Default to 10 branches, adjustable via slider (max 100)
   private cpuCameraFollow = true;  // Auto-follow moves with camera
   private cpuGlobalTurn: PieceColor = 'w';  // Track whose turn globally (independent of per-timeline state)
 
@@ -2104,6 +2116,11 @@ timelines - list timelines`,
   /** Set move delay (100-2000ms) */
   cpuSetDelay(ms: number): void {
     this.cpuMoveDelay = Math.max(100, Math.min(2000, ms));
+  }
+
+  /** Set max timelines/branches (5-100) */
+  setMaxTimelines(count: number): void {
+    this.maxTimelines = Math.max(5, Math.min(100, count));
   }
 
   /** Toggle camera follow mode */
