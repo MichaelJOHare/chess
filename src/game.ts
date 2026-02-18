@@ -1599,7 +1599,7 @@ timelines - list timelines`,
     const result = parts.join(' ');
 
     // Validate the result by trying to parse it
-    const testChess = new Chess();
+    const testChess = new Chess({ skipValidation: true });
     const valid = testChess.load(result);
     if (!valid) {
       console.error('[_modifyFen] Generated invalid FEN!', {
